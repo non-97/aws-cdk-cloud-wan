@@ -1,12 +1,8 @@
 {
   "name": "aws-cdk-cloud-wan",
   "version": "0.1.0",
-  "bin": {
-    "aws-cdk-cloud-wan": "bin/aws-cdk-cloud-wan.js"
-  },
-  "scripts": {
-    "build": "tsc",
-    "watch": "tsc -w",
+"scripts": {
+    "type-check": "tsc --noEmit",
     "test": "jest",
     "cdk": "cdk"
   },
