@@ -1,7 +1,7 @@
 #!/bin/bash -xe
 
 # CloudFormation Fn::Sub による変数置換について:
-# ${VPNID} と ${REGION} はデプロイ時に CloudFormation が実際の値に置換する。
+# ${VPNID}, ${REGION}, ${VPC_CIDR} はデプロイ時に CloudFormation が実際の値に置換する。
 # ${!VAR} はシェル変数として EC2 起動時に展開される (Fn::Sub のエスケープ記法)。
 
 #######################################
@@ -43,14 +43,15 @@ ipsec initnss 2>/dev/null || true
 # 4. IP アドレス / VPN トンネル情報の取得
 #######################################
 
-# IMDSv2 トークンを取得 (AL2023 では IMDSv2 が必須)
-TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+# IMDSv2 トークンを取得 (スクリプト後半でも IMDS を使うため、VPN 待機時間を考慮して TTL を長めに設定)
+TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 1800")
 CGW_IP_ADDRESS=$(curl -s -H "X-aws-ec2-metadata-token: ${!TOKEN}" http://169.254.169.254/latest/meta-data/public-ipv4)
 CGW_PRIVATE_IP_ADDRESS=$(curl -s -H "X-aws-ec2-metadata-token: ${!TOKEN}" http://169.254.169.254/latest/meta-data/local-ipv4)
 
-# AWS API から VPN トンネルの外部 IP アドレスを取得
-OUTSIDE_IP_ADDRESS1=$(aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNID} --region ${REGION} --no-cli-pager | jq -r '.VpnConnections[].Options.TunnelOptions[0].OutsideIpAddress')
-OUTSIDE_IP_ADDRESS2=$(aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNID} --region ${REGION} --no-cli-pager | jq -r '.VpnConnections[].Options.TunnelOptions[1].OutsideIpAddress')
+# AWS API から VPN トンネル情報を1回だけ取得 (API コール削減 + スロットリング回避)
+VPN_JSON=$(aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNID} --region ${REGION} --no-cli-pager)
+OUTSIDE_IP_ADDRESS1=$(echo "${!VPN_JSON}" | jq -r '.VpnConnections[].Options.TunnelOptions[0].OutsideIpAddress')
+OUTSIDE_IP_ADDRESS2=$(echo "${!VPN_JSON}" | jq -r '.VpnConnections[].Options.TunnelOptions[1].OutsideIpAddress')
 
 #######################################
 # 5. Libreswan (IPsec) 設定
@@ -211,8 +212,8 @@ ip netns exec ${!NAMESPACE} ip link set vti2 up mtu 1436
 
 # トンネル内部 IP を AWS API から取得して設定する。
 # /30 サブネットの network+1 が AWS 側、network+2 が CGW 側。
-TUNNEL_IP_CIDR1=$(aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNID} --region ${REGION} --no-cli-pager | jq -r '.VpnConnections[].Options.TunnelOptions[0].TunnelInsideCidr')
-TUNNEL_IP_CIDR2=$(aws ec2 describe-vpn-connections --vpn-connection-ids ${VPNID} --region ${REGION} --no-cli-pager | jq -r '.VpnConnections[].Options.TunnelOptions[1].TunnelInsideCidr')
+TUNNEL_IP_CIDR1=$(echo "${!VPN_JSON}" | jq -r '.VpnConnections[].Options.TunnelOptions[0].TunnelInsideCidr')
+TUNNEL_IP_CIDR2=$(echo "${!VPN_JSON}" | jq -r '.VpnConnections[].Options.TunnelOptions[1].TunnelInsideCidr')
 
 TUNNEL_NET1=$(echo ${!TUNNEL_IP_CIDR1} | cut -d/ -f1 | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, int($4/4)*4}')
 TUNNEL_IP_ADDRESS1_AWS=$(echo ${!TUNNEL_NET1} | awk -F. '{printf "%s.%s.%s.%d", $1, $2, $3, $4+1}')
@@ -231,7 +232,7 @@ ip netns exec ${!NAMESPACE} ip addr add ${!TUNNEL_IP_ADDRESS2_CGW}/30 dev vti2
 # VRF vrf1 で BGP を動作させ、Cloud WAN とルートを交換する。
 # - AS 64901: このオンプレミスルーターの AS 番号
 # - remote-as 65002: Cloud WAN の Region2 側 ASN
-# - aggregate-address: 10.102.0.0/16 をサマリーとして広告
+# - aggregate-address: VPC CIDR をサマリーとして広告
 # - route-map ALLOW_OUT: 広告するプレフィックスを制限
 cat <<FRREOF > /etc/frr/frr.conf
 frr version 10.4
@@ -252,8 +253,8 @@ router bgp 64901 vrf vrf1
  neighbor ${!TUNNEL_IP_ADDRESS2_AWS} ebgp-multihop 255
  !
  address-family ipv4 unicast
-  network 10.102.1.0/24
-  aggregate-address 10.102.0.0/16 summary-only
+  redistribute connected
+  aggregate-address ${VPC_CIDR} summary-only
   neighbor ${!TUNNEL_IP_ADDRESS1_AWS} soft-reconfiguration inbound
   neighbor ${!TUNNEL_IP_ADDRESS2_AWS} soft-reconfiguration inbound
   neighbor ${!TUNNEL_IP_ADDRESS1_AWS} route-map ALLOW_OUT out
@@ -261,7 +262,7 @@ router bgp 64901 vrf vrf1
  exit-address-family
 exit
 !
-ip prefix-list LOCAL seq 5 permit 10.102.0.0/16
+ip prefix-list LOCAL seq 5 permit ${VPC_CIDR}
 !
 route-map ALLOW_OUT permit 10
  match ip address prefix-list LOCAL

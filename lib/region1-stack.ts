@@ -1,8 +1,17 @@
-import * as cdk from 'aws-cdk-lib/core';
-import * as iam from 'aws-cdk-lib/aws-iam';
-import { Construct } from 'constructs';
-import { CoreNetwork, BoundaryVpc, PrivateVpc, SecurityVpc } from './constructs';
-import { REGION1_NETWORK, cloudWanSegment, cloudWanNfg } from './network-config';
+import * as cdk from "aws-cdk-lib/core";
+
+import { Construct } from "constructs";
+import {
+  CoreNetwork,
+  EgressVpc,
+  PrivateVpc,
+  InspectionVpc,
+} from "./constructs";
+import {
+  REGION1_NETWORK,
+  cloudWanSegment,
+  cloudWanNfg,
+} from "./network-config";
 
 export interface Region1StackProps extends cdk.StackProps {
   readonly region2: string;
@@ -16,47 +25,40 @@ export class Region1Stack extends cdk.Stack {
     super(scope, id, props);
 
     // Core Network
-    const coreNetwork = new CoreNetwork(this, 'CoreNetwork', {
+    const coreNetwork = new CoreNetwork(this, "CoreNetwork", {
       region1: this.region,
       region2: props.region2,
     });
     this.coreNetworkId = coreNetwork.coreNetworkId;
     this.coreNetworkArn = coreNetwork.coreNetworkArn;
 
-    // IAM Role + Instance Profile
-    const ec2Role = new iam.Role(this, 'Ec2Role', {
-      assumedBy: new iam.ServicePrincipal('ec2.amazonaws.com'),
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore'),
-        iam.ManagedPolicy.fromAwsManagedPolicyName('ReadOnlyAccess'),
-      ],
-    });
-
-    const instanceProfile = new iam.CfnInstanceProfile(this, 'InstanceProfile', {
-      roles: [ec2Role.roleName],
-    });
-
-    // Boundary VPC
-    new BoundaryVpc(this, 'BoundaryVpc', {
-      vpcCidr: REGION1_NETWORK.boundary.vpcCidr,
+    // Egress VPC
+    new EgressVpc(this, "EgressVpc", {
+      vpcCidr: REGION1_NETWORK.egress.vpcCidr,
       coreNetworkId: coreNetwork.coreNetworkId,
       coreNetworkArn: coreNetwork.coreNetworkArn,
       cloudWanSegmentTag: cloudWanSegment.Share,
     });
 
-    // Private VPC
-    new PrivateVpc(this, 'PrivateVpc', {
-      vpcCidr: REGION1_NETWORK.private.vpcCidr,
+    // Prod Private VPC
+    new PrivateVpc(this, "ProdPrivateVpc", {
+      vpcCidr: REGION1_NETWORK.prodPrivate.vpcCidr,
       coreNetworkId: coreNetwork.coreNetworkId,
       coreNetworkArn: coreNetwork.coreNetworkArn,
       cloudWanSegmentTag: cloudWanSegment.Prod,
-      instanceProfileArn: instanceProfile.ref,
-      ec2PrivateIp: REGION1_NETWORK.private.ec2PrivateIp!,
     });
 
-    // Security VPC
-    new SecurityVpc(this, 'SecurityVpc', {
-      vpcCidr: REGION1_NETWORK.security!.vpcCidr,
+    // Dev Private VPC
+    new PrivateVpc(this, "DevPrivateVpc", {
+      vpcCidr: REGION1_NETWORK.devPrivate!.vpcCidr,
+      coreNetworkId: coreNetwork.coreNetworkId,
+      coreNetworkArn: coreNetwork.coreNetworkArn,
+      cloudWanSegmentTag: cloudWanSegment.Dev,
+    });
+
+    // Inspection VPC
+    new InspectionVpc(this, "InspectionVpc", {
+      vpcCidr: REGION1_NETWORK.inspection!.vpcCidr,
       coreNetworkId: coreNetwork.coreNetworkId,
       coreNetworkArn: coreNetwork.coreNetworkArn,
       cloudWanNfgTag: cloudWanNfg.Security,

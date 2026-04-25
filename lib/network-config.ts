@@ -48,36 +48,39 @@ export const VPN_CONFIG = {
 /** VPC ごとのネットワーク設定 */
 export interface VpcNetworkConfig {
   readonly vpcCidr: string;
-  readonly ec2PrivateIp?: string;
 }
 
 /** リージョンごとのネットワーク設定 */
 export interface RegionNetworkConfig {
-  readonly boundary: VpcNetworkConfig;
-  readonly private: VpcNetworkConfig;
-  readonly security?: VpcNetworkConfig;
+  readonly egress: VpcNetworkConfig;
+  readonly prodPrivate: VpcNetworkConfig;
+  readonly devPrivate?: VpcNetworkConfig;
+
+  readonly inspection?: VpcNetworkConfig;
   readonly vpn?: VpcNetworkConfig;
 }
 
 /** Region1 ネットワーク設定 */
 export const REGION1_NETWORK: RegionNetworkConfig = {
-  boundary: { vpcCidr: '10.0.0.0/16' },
-  private: { vpcCidr: '10.1.0.0/16', ec2PrivateIp: '10.1.1.100' },
-  security: { vpcCidr: '10.3.0.0/16' },
+  egress: { vpcCidr: '10.0.0.0/16' },
+  prodPrivate: { vpcCidr: '10.1.0.0/16' },
+  devPrivate: { vpcCidr: '10.2.0.0/16' },
+  inspection: { vpcCidr: '10.3.0.0/16' },
 };
 
 /** Region2 ネットワーク設定 */
 export const REGION2_NETWORK: RegionNetworkConfig = {
-  boundary: { vpcCidr: '10.100.0.0/16' },
-  private: { vpcCidr: '10.101.0.0/16', ec2PrivateIp: '10.101.1.100' },
+  egress: { vpcCidr: '10.100.0.0/16' },
+  prodPrivate: { vpcCidr: '10.101.0.0/16' },
   vpn: { vpcCidr: '10.102.0.0/16' },
 };
 
-/** NFW ルール変数で使う全VPC CIDRのマップ */
+/** NFW ルール変数で使う全 VPC CIDR のマップ (キー名は NFW の IP Set 変数名として使用される) */
 export const ALL_VPC_CIDRS = {
-  Region1_BoundaryVPC_NET: [REGION1_NETWORK.boundary.vpcCidr],
-  Region1_PrivateVPC_NET: [REGION1_NETWORK.private.vpcCidr],
-  Region2_BoundaryVPC_NET: [REGION2_NETWORK.boundary.vpcCidr],
-  Region2_PrivateVPC_NET: [REGION2_NETWORK.private.vpcCidr],
+  Region1_EgressVPC_NET: [REGION1_NETWORK.egress.vpcCidr],
+  Region1_ProdPrivateVPC_NET: [REGION1_NETWORK.prodPrivate.vpcCidr],
+  Region1_DevPrivateVPC_NET: [REGION1_NETWORK.devPrivate!.vpcCidr],
+  Region2_EgressVPC_NET: [REGION2_NETWORK.egress.vpcCidr],
+  Region2_ProdPrivateVPC_NET: [REGION2_NETWORK.prodPrivate.vpcCidr],
   Region2_VpnVPC_NET: [REGION2_NETWORK.vpn!.vpcCidr],
 } as const;

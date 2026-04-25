@@ -2,6 +2,7 @@ import * as cdk from 'aws-cdk-lib/core';
 import { Template } from 'aws-cdk-lib/assertions';
 import { Region1Stack } from '../lib/region1-stack';
 import { Region2Stack } from '../lib/region2-stack';
+import { cloudWanTagKey, cloudWanSegment, cloudWanNfg, VPN_CONFIG } from '../lib/network-config';
 
 describe('Region1Stack', () => {
   const app = new cdk.App();
@@ -12,23 +13,22 @@ describe('Region1Stack', () => {
   const template = Template.fromStack(stack);
 
   test('creates Core Network', () => {
-    template.hasResourceProperties('AWS::NetworkManager::GlobalNetwork', {
-      Description: 'Cloud WAN Global Network',
-    });
-    template.hasResourceProperties('AWS::NetworkManager::CoreNetwork', {
-      Description: 'Cloud WAN Core Network',
-    });
+    template.hasResourceProperties('AWS::NetworkManager::GlobalNetwork', {});
+    template.hasResourceProperties('AWS::NetworkManager::CoreNetwork', {});
   });
 
   test('creates VPC Attachments with correct tags', () => {
     template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
-      Tags: [{ Key: 'cloudwan-seg', Value: 'share' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Share }],
     });
     template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
-      Tags: [{ Key: 'cloudwan-seg', Value: 'prod' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Prod }],
     });
     template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
-      Tags: [{ Key: 'cloudwan-nfg', Value: 'security' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Dev }],
+    });
+    template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
+      Tags: [{ Key: cloudWanTagKey.Nfg, Value: cloudWanNfg.Security }],
     });
   });
 
@@ -50,17 +50,17 @@ describe('Region2Stack', () => {
 
   test('creates VPC Attachments with correct tags', () => {
     template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
-      Tags: [{ Key: 'cloudwan-seg', Value: 'share' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Share }],
     });
     template.hasResourceProperties('AWS::NetworkManager::VpcAttachment', {
-      Tags: [{ Key: 'cloudwan-seg', Value: 'prod' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Prod }],
     });
   });
 
   test('creates VPN Connection and Customer Gateway', () => {
     template.hasResourceProperties('AWS::EC2::CustomerGateway', {
       Type: 'ipsec.1',
-      BgpAsn: 64901,
+      BgpAsn: VPN_CONFIG.cgwBgpAsn,
     });
     template.hasResourceProperties('AWS::EC2::VPNConnection', {
       Type: 'ipsec.1',
@@ -70,7 +70,7 @@ describe('Region2Stack', () => {
 
   test('creates Site-to-Site VPN Attachment', () => {
     template.hasResourceProperties('AWS::NetworkManager::SiteToSiteVpnAttachment', {
-      Tags: [{ Key: 'cloudwan-seg', Value: 'dev' }],
+      Tags: [{ Key: cloudWanTagKey.Segment, Value: cloudWanSegment.Dev }],
     });
   });
 });

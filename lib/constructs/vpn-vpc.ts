@@ -1,5 +1,6 @@
 import * as cdk from "aws-cdk-lib/core";
 import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as iam from "aws-cdk-lib/aws-iam";
 import * as ssm from "aws-cdk-lib/aws-ssm";
 import * as logs from "aws-cdk-lib/aws-logs";
 import * as networkmanager from "aws-cdk-lib/aws-networkmanager";
@@ -15,8 +16,6 @@ export interface VpnVpcProps {
   readonly coreNetworkId: string;
   /** Cloud WAN セグメント タグ値 */
   readonly cloudWanSegmentTag: string;
-  /** EC2 インスタンスプロファイル ARN */
-  readonly instanceProfileArn: string;
 }
 
 export class VpnVpc extends Construct {
@@ -26,151 +25,74 @@ export class VpnVpc extends Construct {
     super(scope, id);
 
     const stack = cdk.Stack.of(this);
-    const az = cdk.Fn.select(0, cdk.Fn.getAzs());
 
-    // VPC
+    // VPC + Subnet を L2 で構築
     const vpc = new ec2.Vpc(this, "Vpc", {
       ipAddresses: ec2.IpAddresses.cidr(props.vpcCidr),
-      enableDnsSupport: true,
-      enableDnsHostnames: true,
-      subnetConfiguration: [],
+      maxAzs: 1,
       natGateways: 0,
+      restrictDefaultSecurityGroup: false,
+      subnetConfiguration: [
+        { name: "Public", subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
+        {
+          name: "Private",
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24,
+        },
+      ],
     });
     this.vpc = vpc;
 
-    // Subnets
-    const publicSubnet = new ec2.CfnSubnet(this, "PublicSubnet", {
-      vpcId: vpc.vpcId,
-      cidrBlock: cdk.Fn.select(0, cdk.Fn.cidr(props.vpcCidr, 11, "8")),
-      availabilityZone: az,
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-PublicSubnet` }],
-    });
+    const publicSubnet = vpc.selectSubnets({ subnetGroupName: "Public" })
+      .subnets[0];
+    const privateSubnet = vpc.selectSubnets({ subnetGroupName: "Private" })
+      .subnets[0];
 
-    const privateSubnet = new ec2.CfnSubnet(this, "PrivateSubnet", {
-      vpcId: vpc.vpcId,
-      cidrBlock: cdk.Fn.select(1, cdk.Fn.cidr(props.vpcCidr, 11, "8")),
-      availabilityZone: az,
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-PrivateSubnet` }],
+    // Security Groups (L2)
+    const vpnSg = new ec2.SecurityGroup(this, "VpnSg", {
+      vpc,
+      description: "for VPN Router",
     });
+    vpnSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(500));
+    vpnSg.addIngressRule(ec2.Peer.anyIpv4(), ec2.Port.udp(4500));
+    for (const cidr of RFC1918_CIDRS) {
+      vpnSg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.allTraffic());
+    }
 
-    const private2Subnet = new ec2.CfnSubnet(this, "Private2Subnet", {
-      vpcId: vpc.vpcId,
-      cidrBlock: cdk.Fn.select(2, cdk.Fn.cidr(props.vpcCidr, 11, "8")),
-      availabilityZone: az,
-      tags: [
-        { key: "Name", value: `${stack.stackName}-VpnVpc-Private2Subnet` },
-      ],
+    const ec2Sg = new ec2.SecurityGroup(this, "Ec2Sg", {
+      vpc,
+      description: "for EC2 instance",
     });
+    for (const cidr of RFC1918_CIDRS) {
+      ec2Sg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.allTraffic());
+    }
 
-    // Internet Gateway
-    const igw = new ec2.CfnInternetGateway(this, "Igw", {});
-    new ec2.CfnVPCGatewayAttachment(this, "IgwAttach", {
-      internetGatewayId: igw.ref,
-      vpcId: vpc.vpcId,
-    });
-
-    // Route Tables
-    const publicSubnetRtb = new ec2.CfnRouteTable(this, "PublicSubnetRtb", {
-      vpcId: vpc.vpcId,
-      tags: [
-        { key: "Name", value: `${stack.stackName}-VpnVpc-PublicSubnetRtb` },
-      ],
-    });
-
-    const privateSubnetRtb = new ec2.CfnRouteTable(this, "PrivateSubnetRtb", {
-      vpcId: vpc.vpcId,
-      tags: [
-        { key: "Name", value: `${stack.stackName}-VpnVpc-PrivateSubnetRtb` },
-      ],
-    });
-
-    // Route Table Associations
-    new ec2.CfnSubnetRouteTableAssociation(this, "PublicSubnetRtbAssoc", {
-      subnetId: publicSubnet.ref,
-      routeTableId: publicSubnetRtb.ref,
-    });
-
-    new ec2.CfnSubnetRouteTableAssociation(this, "PrivateSubnetRtbAssoc", {
-      subnetId: privateSubnet.ref,
-      routeTableId: privateSubnetRtb.ref,
-    });
-
-    // Routes - Public Subnet
-    new ec2.CfnRoute(this, "PublicSubnetDefaultRoute", {
-      routeTableId: publicSubnetRtb.ref,
-      destinationCidrBlock: "0.0.0.0/0",
-      gatewayId: igw.ref,
-    });
-
-    // Security Groups
-    const vpnSg = new ec2.CfnSecurityGroup(this, "VpnSg", {
-      groupDescription: "for VPN Router",
-      vpcId: vpc.vpcId,
-      securityGroupIngress: [
-        { ipProtocol: "udp", fromPort: 500, toPort: 500, cidrIp: "0.0.0.0/0" },
-        {
-          ipProtocol: "udp",
-          fromPort: 4500,
-          toPort: 4500,
-          cidrIp: "0.0.0.0/0",
-        },
-        ...RFC1918_CIDRS.map((cidr) => ({
-          ipProtocol: "-1",
-          fromPort: -1,
-          toPort: -1,
-          cidrIp: cidr,
-        })),
-      ],
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-VpnSg` }],
-    });
-
-    const ec2Sg = new ec2.CfnSecurityGroup(this, "Ec2Sg", {
-      groupDescription: "for EC2 instance",
-      vpcId: vpc.vpcId,
-      securityGroupIngress: RFC1918_CIDRS.map((cidr) => ({
-        ipProtocol: "-1",
-        fromPort: -1,
-        toPort: -1,
-        cidrIp: cidr,
-      })),
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-Ec2Sg` }],
-    });
-
-    // VPN Router ENIs
+    // VPN Router ENIs (L1: 複数 ENI + sourceDestCheck=false)
     const vpnEni0 = new ec2.CfnNetworkInterface(this, "VpnEni0", {
       description: "eth0",
-      privateIpAddress: "10.102.0.100",
       sourceDestCheck: false,
-      subnetId: publicSubnet.ref,
-      groupSet: [vpnSg.attrGroupId],
+      subnetId: publicSubnet.subnetId,
+      groupSet: [vpnSg.securityGroupId],
     });
 
     const vpnEni1 = new ec2.CfnNetworkInterface(this, "VpnEni1", {
       description: "eth1",
-      privateIpAddress: "10.102.1.101",
       sourceDestCheck: false,
-      subnetId: privateSubnet.ref,
-      groupSet: [vpnSg.attrGroupId],
-    });
-
-    const vpnEni2 = new ec2.CfnNetworkInterface(this, "VpnEni2", {
-      description: "eth2",
-      subnetId: private2Subnet.ref,
-      groupSet: [vpnSg.attrGroupId],
+      subnetId: privateSubnet.subnetId,
+      groupSet: [vpnSg.securityGroupId],
     });
 
     // VPN Router EIP
     const vpnEip = new ec2.CfnEIP(this, "VpnEip", { domain: "vpc" });
 
-    // Customer Gateway
+    // Customer Gateway (L1: L2 なし)
     const cgw = new ec2.CfnCustomerGateway(this, "CustomerGateway", {
       type: "ipsec.1",
       bgpAsn: VPN_CONFIG.cgwBgpAsn,
       ipAddress: vpnEip.ref,
-      tags: [{ key: "Name", value: `${stack.stackName}-Cgw` }],
     });
 
-    // CloudWatch Log Groups for VPN tunnel logging
+    // CloudWatch Log Groups
     const vpnActivityLogGroup = new logs.LogGroup(this, "VpnActivityLogGroup", {
       retention: logs.RetentionDays.ONE_MONTH,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
@@ -180,7 +102,7 @@ export class VpnVpc extends Construct {
       removalPolicy: cdk.RemovalPolicy.DESTROY,
     });
 
-    // Shared tunnel options (IKEv2, matching screenshot configuration)
+    // VPN トンネルオプション (IKEv2)
     const tunnelOptions = {
       ikeVersions: [{ value: "ikev2" }],
       phase1EncryptionAlgorithms: [
@@ -255,7 +177,7 @@ export class VpnVpc extends Construct {
       },
     };
 
-    // VPN Connection (no gateway - attached to Cloud WAN via S2S Attachment)
+    // VPN Connection (L1: Cloud WAN 用パターン + 詳細トンネルオプション)
     const vpnConn = new ec2.CfnVPNConnection(this, "VpnConnection", {
       type: "ipsec.1",
       staticRoutesOnly: false,
@@ -272,10 +194,9 @@ export class VpnVpc extends Construct {
           ...tunnelOptions,
         },
       ],
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnConn` }],
     });
 
-    // Read UserData script and substitute variables
+    // UserData (Fn::Sub で VPNID / REGION を置換)
     const userDataScript = fs.readFileSync(
       path.join(__dirname, "../../src/ec2/vpn-router-userdata.sh"),
       "utf-8"
@@ -283,92 +204,97 @@ export class VpnVpc extends Construct {
     const userDataWithVars = cdk.Fn.sub(userDataScript, {
       VPNID: vpnConn.ref,
       REGION: cdk.Aws.REGION,
+      VPC_CIDR: props.vpcCidr,
     });
 
-    // VPN Router EC2 Instance (Amazon Linux 2023 with Libreswan + FRR)
+    // VPN Router 用 IAM Role (UserData で AWS API を呼ぶための最小権限)
+    const vpnRouterRole = new iam.Role(this, "VpnRouterRole", {
+      assumedBy: new iam.ServicePrincipal("ec2.amazonaws.com"),
+      inlinePolicies: {
+        vpnRouterPolicy: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ["ec2:DescribeVpnConnections", "ec2:DescribeInstances"],
+              resources: ["*"],
+            }),
+          ],
+        }),
+      },
+    });
+
+    // VPN Router EC2 (L1: 3 ENI 構成)
     const vpnRouterAmiId = ssm.StringParameter.valueForStringParameter(
       this,
       "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
     );
-    const vpnRouter = new ec2.CfnInstance(this, "VpnRouter", {
+    new ec2.CfnInstance(this, "VpnRouter", {
       imageId: vpnRouterAmiId,
       instanceType: "t3.small",
-      iamInstanceProfile: props.instanceProfileArn,
+      iamInstanceProfile: new iam.CfnInstanceProfile(this, "VpnRouterProfile", {
+        roles: [vpnRouterRole.roleName],
+      }).ref,
       networkInterfaces: [
         { networkInterfaceId: vpnEni0.ref, deviceIndex: "0" },
         { networkInterfaceId: vpnEni1.ref, deviceIndex: "1" },
-        { networkInterfaceId: vpnEni2.ref, deviceIndex: "2" },
       ],
       userData: cdk.Fn.base64(userDataWithVars),
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnRouter` }],
     });
 
-    // EIP Association (after IGW attachment)
+    // EIP Association
     new ec2.CfnEIPAssociation(this, "VpnEipAssoc", {
       allocationId: vpnEip.attrAllocationId,
       networkInterfaceId: vpnEni0.attrId,
     });
 
-    // EC2 Instance (on-premise simulation)
-    const al2023AmiId = ssm.StringParameter.valueForStringParameter(
-      this,
-      "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
-    );
-    new ec2.CfnInstance(this, "Instance", {
-      imageId: al2023AmiId,
-      instanceType: "t3.micro",
-      iamInstanceProfile: props.instanceProfileArn,
-      networkInterfaces: [
-        {
-          deviceIndex: "0",
-          subnetId: privateSubnet.ref,
-          groupSet: [ec2Sg.attrGroupId],
-          privateIpAddresses: [
-            { privateIpAddress: "10.102.1.100", primary: true },
-          ],
-        },
-      ],
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-Instance` }],
+    // オンプレミス側 EC2 (L2: 単一 ENI)
+    new ec2.Instance(this, "Instance", {
+      vpc,
+      vpcSubnets: { subnets: [privateSubnet] },
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T3,
+        ec2.InstanceSize.MICRO
+      ),
+      machineImage: ec2.MachineImage.fromSsmParameter(
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+      ),
+      securityGroup: ec2Sg,
+      ssmSessionPermissions: true,
     });
 
     // EIC Endpoint
-    const eicSg = new ec2.CfnSecurityGroup(this, "EicSg", {
-      groupDescription: "for EIC Endpoint",
-      vpcId: vpc.vpcId,
-      securityGroupEgress: [
-        { ipProtocol: "tcp", fromPort: 22, toPort: 22, cidrIp: props.vpcCidr },
-      ],
-      tags: [{ key: "Name", value: `${stack.stackName}-VpnVpc-EicSg` }],
+    const eicSg = new ec2.SecurityGroup(this, "EicSg", {
+      vpc,
+      description: "for EIC Endpoint",
+      allowAllOutbound: false,
     });
+    eicSg.addEgressRule(ec2.Peer.ipv4(props.vpcCidr), ec2.Port.tcp(22));
 
     new ec2.CfnInstanceConnectEndpoint(this, "EicEndpoint", {
-      subnetId: private2Subnet.ref,
-      securityGroupIds: [eicSg.attrGroupId],
+      subnetId: privateSubnet.subnetId,
+      securityGroupIds: [eicSg.securityGroupId],
     });
 
-    // Routes - Private Subnet (via VPN Router eth1)
+    // Private Subnet ルート (VPN Router eth1 経由)
     new ec2.CfnRoute(this, "PrivateSubnetDefaultRoute", {
-      routeTableId: privateSubnetRtb.ref,
+      routeTableId: privateSubnet.routeTable.routeTableId,
       destinationCidrBlock: "0.0.0.0/0",
       networkInterfaceId: vpnEni1.attrId,
     });
 
     // Cloud WAN Site-to-Site VPN Attachment
-    const vpnConnArn = cdk.Arn.format(
-      {
-        service: "ec2",
-        resource: "vpn-connection",
-        resourceName: vpnConn.ref,
-      },
-      stack
-    );
-
     new networkmanager.CfnSiteToSiteVpnAttachment(
       this,
       "SiteToSiteVpnAttachment",
       {
         coreNetworkId: props.coreNetworkId,
-        vpnConnectionArn: vpnConnArn,
+        vpnConnectionArn: cdk.Arn.format(
+          {
+            service: "ec2",
+            resource: "vpn-connection",
+            resourceName: vpnConn.ref,
+          },
+          stack
+        ),
         tags: [
           { key: cloudWanTagKey.Segment, value: props.cloudWanSegmentTag },
         ],

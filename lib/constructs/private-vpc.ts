@@ -1,9 +1,8 @@
-import * as cdk from 'aws-cdk-lib/core';
-import * as ec2 from 'aws-cdk-lib/aws-ec2';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as networkmanager from 'aws-cdk-lib/aws-networkmanager';
-import { Construct } from 'constructs';
-import { RFC1918_CIDRS, cloudWanTagKey } from '../network-config';
+import * as cdk from "aws-cdk-lib/core";
+import * as ec2 from "aws-cdk-lib/aws-ec2";
+import * as networkmanager from "aws-cdk-lib/aws-networkmanager";
+import { Construct } from "constructs";
+import { RFC1918_CIDRS, cloudWanTagKey } from "../network-config";
 
 export interface PrivateVpcProps {
   /** VPC CIDR ブロック */
@@ -14,10 +13,6 @@ export interface PrivateVpcProps {
   readonly coreNetworkArn: string;
   /** Cloud WAN セグメント タグ値 */
   readonly cloudWanSegmentTag: string;
-  /** EC2 インスタンスプロファイル ARN */
-  readonly instanceProfileArn: string;
-  /** EC2 のプライベート IP アドレス */
-  readonly ec2PrivateIp: string;
 }
 
 export class PrivateVpc extends Construct {
@@ -26,126 +21,99 @@ export class PrivateVpc extends Construct {
   constructor(scope: Construct, id: string, props: PrivateVpcProps) {
     super(scope, id);
 
-    const stack = cdk.Stack.of(this);
-    const az = cdk.Fn.select(0, cdk.Fn.getAzs());
-
-    // VPC
-    const vpc = new ec2.Vpc(this, 'Vpc', {
+    const vpc = new ec2.Vpc(this, "Vpc", {
       ipAddresses: ec2.IpAddresses.cidr(props.vpcCidr),
-      enableDnsSupport: true,
-      enableDnsHostnames: true,
-      subnetConfiguration: [],
+      maxAzs: 1,
       natGateways: 0,
+      restrictDefaultSecurityGroup: false,
+      subnetConfiguration: [
+        {
+          name: "Private",
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24,
+        },
+        {
+          name: "CloudWanAttachment",
+          subnetType: ec2.SubnetType.PRIVATE_ISOLATED,
+          cidrMask: 24,
+        },
+      ],
     });
     this.vpc = vpc;
 
-    // Subnets
-    const privateSubnet = new ec2.CfnSubnet(this, 'PrivateSubnet', {
-      vpcId: vpc.vpcId,
-      cidrBlock: cdk.Fn.select(1, cdk.Fn.cidr(props.vpcCidr, 11, '8')),
-      availabilityZone: az,
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-PrivateSubnet` }],
-    });
-
-    const attSubnet = new ec2.CfnSubnet(this, 'AttSubnet', {
-      vpcId: vpc.vpcId,
-      cidrBlock: cdk.Fn.select(10, cdk.Fn.cidr(props.vpcCidr, 11, '8')),
-      availabilityZone: az,
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-AttSubnet` }],
-    });
-
-    // Route Tables
-    const privateSubnetRtb = new ec2.CfnRouteTable(this, 'PrivateSubnetRtb', {
-      vpcId: vpc.vpcId,
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-PrivateSubnetRtb` }],
-    });
-
-    const attSubnetRtb = new ec2.CfnRouteTable(this, 'AttSubnetRtb', {
-      vpcId: vpc.vpcId,
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-AttSubnetRtb` }],
-    });
-
-    // Route Table Associations
-    new ec2.CfnSubnetRouteTableAssociation(this, 'PrivateSubnetRtbAssoc', {
-      subnetId: privateSubnet.ref,
-      routeTableId: privateSubnetRtb.ref,
-    });
-
-    new ec2.CfnSubnetRouteTableAssociation(this, 'AttSubnetRtbAssoc', {
-      subnetId: attSubnet.ref,
-      routeTableId: attSubnetRtb.ref,
-    });
+    const privateSubnet = vpc.selectSubnets({ subnetGroupName: 'Private' }).subnets[0];
+    const cloudWanSubnet = vpc.selectSubnets({ subnetGroupName: 'CloudWanAttachment' }).subnets[0];
 
     // Security Group for EC2
-    const ec2Sg = new ec2.CfnSecurityGroup(this, 'Ec2Sg', {
-      groupDescription: 'for EC2 instance',
-      vpcId: vpc.vpcId,
-      securityGroupIngress: RFC1918_CIDRS.map((cidr) => ({
-        ipProtocol: '-1',
-        fromPort: -1,
-        toPort: -1,
-        cidrIp: cidr,
-      })),
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-Ec2Sg` }],
+    const ec2Sg = new ec2.SecurityGroup(this, "Ec2Sg", {
+      vpc,
+      description: "for EC2 instance",
     });
+    for (const cidr of RFC1918_CIDRS) {
+      ec2Sg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.allTraffic());
+    }
 
-    // EC2 Instance (AMI resolved at deploy time via SSM parameter)
-    const al2023AmiId = ssm.StringParameter.valueForStringParameter(
-      this,
-      '/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64',
-    );
-    new ec2.CfnInstance(this, 'Instance', {
-      imageId: al2023AmiId,
-      instanceType: 't3.micro',
-      iamInstanceProfile: props.instanceProfileArn,
-      networkInterfaces: [
-        {
-          deviceIndex: '0',
-          subnetId: privateSubnet.ref,
-          groupSet: [ec2Sg.attrGroupId],
-          privateIpAddresses: [
-            { privateIpAddress: props.ec2PrivateIp, primary: true },
-          ],
-        },
-      ],
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-Instance` }],
+    // EC2 Instance
+    new ec2.Instance(this, "Instance", {
+      vpc,
+      vpcSubnets: { subnets: [privateSubnet] },
+      instanceType: ec2.InstanceType.of(
+        ec2.InstanceClass.T3,
+        ec2.InstanceSize.MICRO
+      ),
+      machineImage: ec2.MachineImage.fromSsmParameter(
+        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64"
+      ),
+      securityGroup: ec2Sg,
+      ssmSessionPermissions: true,
     });
 
     // EIC Endpoint
-    const eicSg = new ec2.CfnSecurityGroup(this, 'EicSg', {
-      groupDescription: 'for EIC Endpoint',
-      vpcId: vpc.vpcId,
-      securityGroupEgress: [
-        { ipProtocol: 'tcp', fromPort: 22, toPort: 22, cidrIp: props.vpcCidr },
-      ],
-      tags: [{ key: 'Name', value: `${stack.stackName}-PrivateVpc-EicSg` }],
+    const eicSg = new ec2.SecurityGroup(this, "EicSg", {
+      vpc,
+      description: "for EIC Endpoint",
+      allowAllOutbound: false,
     });
+    eicSg.addEgressRule(ec2.Peer.ipv4(props.vpcCidr), ec2.Port.tcp(22));
 
-    new ec2.CfnInstanceConnectEndpoint(this, 'EicEndpoint', {
-      subnetId: privateSubnet.ref,
-      securityGroupIds: [eicSg.attrGroupId],
+    new ec2.CfnInstanceConnectEndpoint(this, "EicEndpoint", {
+      subnetId: privateSubnet.subnetId,
+      securityGroupIds: [eicSg.securityGroupId],
     });
 
     // Cloud WAN VPC Attachment
-    const attachment = new networkmanager.CfnVpcAttachment(this, 'CloudWanAttachment', {
-      coreNetworkId: props.coreNetworkId,
-      vpcArn: vpc.vpcArn,
-      subnetArns: [
-        cdk.Arn.format({
-          service: 'ec2',
-          resource: 'subnet',
-          resourceName: attSubnet.ref,
-        }, stack),
-      ],
-      tags: [{ key: cloudWanTagKey.Segment, value: props.cloudWanSegmentTag }],
-    });
+    const attachment = new networkmanager.CfnVpcAttachment(
+      this,
+      "CloudWanAttachment",
+      {
+        coreNetworkId: props.coreNetworkId,
+        vpcArn: vpc.vpcArn,
+        subnetArns: [
+          cdk.Arn.format(
+            {
+              service: "ec2",
+              resource: "subnet",
+              resourceName: cloudWanSubnet.subnetId,
+            },
+            cdk.Stack.of(this)
+          ),
+        ],
+        tags: [
+          { key: cloudWanTagKey.Segment, value: props.cloudWanSegmentTag },
+        ],
+      }
+    );
 
-    // Core Network Route (Private Subnet - all traffic via Cloud WAN)
-    const coreNetworkRoute = new ec2.CfnRoute(this, 'PrivateSubnetDefaultRoute', {
-      routeTableId: privateSubnetRtb.ref,
-      destinationCidrBlock: '0.0.0.0/0',
-      coreNetworkArn: props.coreNetworkArn,
-    });
+    // Private Subnet: 全トラフィックを Cloud WAN へ
+    const coreNetworkRoute = new ec2.CfnRoute(
+      this,
+      "PrivateSubnetDefaultRoute",
+      {
+        routeTableId: privateSubnet.routeTable.routeTableId,
+        destinationCidrBlock: "0.0.0.0/0",
+        coreNetworkArn: props.coreNetworkArn,
+      }
+    );
     coreNetworkRoute.addDependency(attachment);
   }
 }
