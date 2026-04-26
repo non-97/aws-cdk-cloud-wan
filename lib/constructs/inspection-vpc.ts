@@ -125,7 +125,7 @@ export class InspectionVpc extends Construct {
     );
 
     // Cloud WAN Attachment Subnet: Cloud WAN からのトラフィックを NFW へ
-    new ec2.CfnRoute(this, 'AttSubnetDefaultRoute', {
+    new ec2.CfnRoute(this, 'CloudWanSubnetDefaultRoute', {
       routeTableId: cloudWanSubnet.routeTable.routeTableId,
       destinationCidrBlock: '0.0.0.0/0',
       vpcEndpointId: fwEndpointId,
